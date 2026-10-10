@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>SA Offline Learning</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#FF6A2B">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="app-shell">
+  <div class="offline-banner" id="offlineBanner"><span class="dot"></span>You're offline — everything here still works. Changes will sync when you're back online.</div>
+  <div id="app"></div>
+  <nav class="bottom-nav" id="bottomNav"></nav>
+</div>
+<div class="sync-pill" id="syncPill"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/js/db.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/sync.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

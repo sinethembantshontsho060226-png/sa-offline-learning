@@ -1,0 +1,15 @@
+{
+  "name": "SA Offline Learning App",
+  "short_name": "Learn Offline",
+  "description": "Learn Anywhere, Anytime — No Data Needed",
+  "start_url": "/#/home",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F5F5F5",
+  "theme_color": "#FF6A2B",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

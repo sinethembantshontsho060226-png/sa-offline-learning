@@ -532,6 +532,14 @@ def api_quiz_results(quiz_id):
     return jsonify({"quiz": dict(quiz), "results": [dict(r) for r in rows]})
 
 
+
+# Runs the moment this module is imported — by `python app.py` locally,
+# AND by gunicorn/any WSGI server in production (e.g. `gunicorn app:app`
+# on Render). Safe to run on every boot: schema uses CREATE TABLE IF NOT
+# EXISTS and the school import uses INSERT OR IGNORE, so this never
+# duplicates data or wipes anything that's already there.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=True, host="0.0.0.0", port=port)

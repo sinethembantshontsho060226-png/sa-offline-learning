@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS quiz_results (
     score           INTEGER NOT NULL,
     total           INTEGER NOT NULL,
     answers_json    TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 1,
     submitted_at    TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (quiz_id) REFERENCES quizzes (id),
     FOREIGN KEY (student_id) REFERENCES users (id),

@@ -13,6 +13,87 @@ function uuid() {
   });
 }
 function nowIso() { return new Date().toISOString(); }
+
+// --------------------------------------------------------------------------
+// Quiz grading helpers (WeBWorK-style: multiple attempts, best score kept)
+// --------------------------------------------------------------------------
+function isQuizClosed(quiz) {
+  if (!quiz.due_date) return false;
+  // A due date closes the quiz at the end of that day, local time —
+  // matches "This homework set is closed" behaviour.
+  return new Date() > new Date(quiz.due_date + "T23:59:59");
+}
+
+function gradeShortAnswer(given, correct) {
+  // Deliberately NOT full symbolic math equivalence (that needs a real
+  // computer-algebra engine, like WeBWorK's own backend uses) — this is a
+  // pragmatic normalized text/number match: trims, lowercases, collapses
+  // whitespace, and allows numeric answers to match regardless of exact
+  // formatting ("4" / "4.0" / " 4 " all match).
+  const norm = (s) => (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+  const g = norm(given), c = norm(correct);
+  if (g === c) return true;
+  const gn = parseFloat(g), cn = parseFloat(c);
+  return Number.isFinite(gn) && Number.isFinite(cn) && Math.abs(gn - cn) < 1e-6;
+}
+
+function gradeQuestion(q, given) {
+  if ((q.type || "mcq") === "short") return gradeShortAnswer(given, q.answer);
+  return Number(given) === q.correct;
+}
+
+const MATH_SYMBOLS = ["√", "π", "∞", "±", "≤", "≥", "×", "÷", "²", "³", "^", "/"];
+function symbolPaletteHtml() {
+  return `<div class="symbol-palette">
+    <div style="font-size:11px; font-weight:700; color:var(--text-sub); margin-bottom:6px; padding: 0 20px;">MATH SYMBOLS — tap to insert into the focused answer</div>
+    <div style="display:flex; flex-wrap:wrap; gap:6px; padding: 0 20px 14px;">
+      ${MATH_SYMBOLS.map((s) => `<button type="button" class="symbol-btn" data-sym="${s}">${s}</button>`).join("")}
+    </div>
+  </div>`;
+}
+function wireSymbolPalette(container) {
+  let lastFocused = null;
+  container.querySelectorAll(".short-answer-input").forEach((inp) => {
+    inp.addEventListener("focus", () => { lastFocused = inp; });
+  });
+  const firstInput = container.querySelector(".short-answer-input");
+  if (firstInput) lastFocused = firstInput;
+  container.querySelectorAll(".symbol-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!lastFocused) return;
+      const sym = btn.dataset.sym;
+      const start = lastFocused.selectionStart ?? lastFocused.value.length;
+      const end = lastFocused.selectionEnd ?? lastFocused.value.length;
+      lastFocused.value = lastFocused.value.slice(0, start) + sym + lastFocused.value.slice(end);
+      lastFocused.focus();
+      lastFocused.selectionStart = lastFocused.selectionEnd = start + sym.length;
+    });
+  });
+}
+
+// --------------------------------------------------------------------------
+// Schools bundle — downloaded ONCE per device (gzipped, ~330KB), cached in
+// IndexedDB, then searched entirely client-side. This is what keeps the
+// single most frequent request in the app (school search, on every signup)
+// off the server/database, which matters a lot on a small free-tier host.
+// --------------------------------------------------------------------------
+let _schoolsMemCache = null;
+async function getSchoolsBundle() {
+  if (_schoolsMemCache) return _schoolsMemCache;
+  const cached = await DB.kvGet("schools_bundle");
+  if (cached && cached.length) { _schoolsMemCache = cached; return cached; }
+  if (!navigator.onLine) return null;
+  try {
+    const resp = await fetch("/static/data/sa_schools.json");
+    if (!resp.ok) throw new Error("bad response");
+    const data = await resp.json();
+    _schoolsMemCache = data;
+    await DB.kvSet("schools_bundle", data);
+    return data;
+  } catch (e) {
+    return null; // caller falls back to the live /api/schools search
+  }
+}
 function escapeHtml(s) {
   return (s ?? "").toString().replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -36,6 +117,22 @@ const UI = {
     if (autoHideMs) el._t = setTimeout(() => el.classList.remove("show"), autoHideMs);
   },
   hideSyncPill() { document.getElementById("syncPill").classList.remove("show"); },
+  // Shows immediate feedback on submit, then — if it's still going after
+  // 3s — switches to a "waking up the server" message, since a sleeping
+  // free-tier host can take real time to respond and a static button
+  // makes the app look frozen/broken during that wait.
+  async withLoadingButton(btn, originalText, task) {
+    btn.disabled = true;
+    btn.textContent = "Please wait…";
+    const slowTimer = setTimeout(() => { btn.textContent = "Waking up the server… this can take up to a minute"; }, 3000);
+    try {
+      return await task();
+    } finally {
+      clearTimeout(slowTimer);
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  },
   updateOfflineBanner() {
     document.getElementById("offlineBanner").classList.toggle("show", !navigator.onLine);
   },
@@ -178,13 +275,16 @@ Views.login = (app) => {
   document.getElementById("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
     try {
-      const res = await API.login({ email: fd.get("email"), password: fd.get("password") });
-      await Session.set(res.token, res.user);
-      await Sync.run(res.user);
+      await UI.withLoadingButton(btn, "Log in", async () => {
+        const res = await API.login({ email: fd.get("email"), password: fd.get("password") });
+        await Session.set(res.token, res.user);
+        await Sync.run(res.user);
+      });
       location.hash = "#/home";
     } catch (err) {
-      UI.toast(navigator.onLine ? err.message : "You're offline — connect once to log in.");
+      UI.toast(navigator.onLine ? err.message : "You're offline — connect once to log in.", 4000);
     }
   });
 };
@@ -242,26 +342,45 @@ Views.signup = (app) => {
   const emisField = document.getElementById("schoolEmis");
   const selectedBox = document.getElementById("schoolSelected");
   const selectedName = document.getElementById("schoolSelectedName");
+
+  // Kick off the (cached-after-first-time) bundle download in the
+  // background the moment this screen opens, so it's usually ready
+  // before the person finishes typing their school's name.
+  const bundlePromise = getSchoolsBundle();
+
+  function renderSchoolResults(schools) {
+    resultsBox.innerHTML = schools.length
+      ? schools.slice(0, 25).map((s) => `<div class="school-result-item" data-emis="${s.emis}" data-name="${escapeHtml(s.name)}"><div class="n">${escapeHtml(s.name)}</div><div class="d">${escapeHtml(s.province || "")} · ${escapeHtml(s.district || "")}</div></div>`).join("")
+      : `<div class="school-result-item"><div class="n">No matches</div></div>`;
+    resultsBox.classList.add("open");
+  }
+
   let debounceTimer;
   schoolInput.addEventListener("input", () => {
     clearTimeout(debounceTimer);
     const q = schoolInput.value.trim();
     emisField.value = "";
     if (q.length < 2) { resultsBox.classList.remove("open"); resultsBox.innerHTML = ""; return; }
-    if (!navigator.onLine) {
-      resultsBox.innerHTML = `<div class="school-result-item"><div class="n">You're offline</div><div class="d">Connect once to search and create your account.</div></div>`;
-      resultsBox.classList.add("open");
-      return;
-    }
+
     debounceTimer = setTimeout(async () => {
+      const bundle = await bundlePromise;
+      if (bundle) {
+        // Instant, on-device filtering — no network, no server load at all.
+        const needle = q.toLowerCase();
+        renderSchoolResults(bundle.filter((s) => s.name.toLowerCase().includes(needle)));
+        return;
+      }
+      // Fallback only if the bundle genuinely couldn't be fetched/cached yet.
+      if (!navigator.onLine) {
+        resultsBox.innerHTML = `<div class="school-result-item"><div class="n">You're offline</div><div class="d">Connect once to search and create your account.</div></div>`;
+        resultsBox.classList.add("open");
+        return;
+      }
       try {
         const schools = await API.searchSchools(q);
-        resultsBox.innerHTML = schools.length
-          ? schools.map((s) => `<div class="school-result-item" data-emis="${s.emis}" data-name="${escapeHtml(s.name)}"><div class="n">${escapeHtml(s.name)}</div><div class="d">${escapeHtml(s.province || "")} · ${escapeHtml(s.district || "")}</div></div>`).join("")
-          : `<div class="school-result-item"><div class="n">No matches</div></div>`;
-        resultsBox.classList.add("open");
+        renderSchoolResults(schools);
       } catch (e) { /* ignore */ }
-    }, 220);
+    }, q.length <= 3 ? 220 : 60); // short searches are typed fastest; bundle filtering is cheap once cached
   });
   resultsBox.addEventListener("click", (e) => {
     const item = e.target.closest(".school-result-item");
@@ -281,16 +400,19 @@ Views.signup = (app) => {
     const fd = new FormData(e.target);
     if (fd.get("password") !== fd.get("confirm_password")) return UI.toast("Passwords don't match.");
     if (!fd.get("school_emis")) return UI.toast("Please select your school.");
+    const btn = e.target.querySelector('button[type="submit"]');
     try {
-      const res = await API.signup({
-        full_name: fd.get("full_name"), email: fd.get("email"), password: fd.get("password"),
-        role: fd.get("role"), school_emis: Number(fd.get("school_emis")), grade: fd.get("grade") ? Number(fd.get("grade")) : null,
+      await UI.withLoadingButton(btn, "Create account", async () => {
+        const res = await API.signup({
+          full_name: fd.get("full_name"), email: fd.get("email"), password: fd.get("password"),
+          role: fd.get("role"), school_emis: Number(fd.get("school_emis")), grade: fd.get("grade") ? Number(fd.get("grade")) : null,
+        });
+        await Session.set(res.token, res.user);
+        await Sync.run(res.user);
       });
-      await Session.set(res.token, res.user);
-      await Sync.run(res.user);
       location.hash = "#/home";
     } catch (err) {
-      UI.toast(navigator.onLine ? err.message : "You're offline — connect once to create your account.");
+      UI.toast(navigator.onLine ? err.message : "You're offline — connect once to create your account.", 4000);
     }
   });
 };
@@ -481,7 +603,7 @@ Views.noteNew = (app) => {
     }
     await DB.put("notes", note);
     UI.toast(navigator.onLine ? "Shared — syncing now." : "Saved on this device — will share once you're online.");
-    if (navigator.onLine) Sync.run(user, { silent: true }).then(() => Router.rerender());
+    if (navigator.onLine) Sync.run(user, { silent: true }); // don't force-rerender — could clobber an unrelated screen the user has since moved to
     location.hash = "#/notes";
   });
 };
@@ -495,20 +617,31 @@ Views.quizzes = async (app) => {
   // Every quiz_result stored on this device belongs to the signed-in
   // student (results aren't synced down for anyone else), so no filter needed.
   const results = user.role === "student" ? await DB.all("quiz_results") : [];
-  const attemptedIds = new Set(results.map((r) => r.quiz_id));
+  const resultByQuiz = Object.fromEntries(results.map((r) => [r.quiz_id, r]));
 
   app.innerHTML = `
     ${topHeader("Quizzes", "/home")}
     ${user.role === "teacher" ? `<div style="padding: 14px 20px 4px;"><a href="#/quizzes/new" class="btn-primary" style="display:block; text-align:center; text-decoration:none; box-sizing:border-box;">+ Create a new quiz</a></div>` : ""}
     <div style="padding-top: 12px;">
       ${quizzes.length === 0 ? `<div class="empty-state"><div class="emoji">🧠</div><p>No quizzes yet${user.role === "student" ? " for your grade" : ""}.</p></div>` : ""}
-      ${quizzes.map((q) => `
-        <a href="#/quizzes/${q.id}/${user.role === "student" ? "take" : "results"}" class="list-item">
+      ${quizzes.map((q) => {
+        let pill;
+        if (user.role === "student") {
+          const r = resultByQuiz[q.id];
+          const closed = isQuizClosed(q);
+          if (r) pill = `<span class="pill green">${r.score}/${r.total} · ${r.attempts} attempt${r.attempts !== 1 ? "s" : ""}</span>`;
+          else if (closed) pill = `<span class="pill">Closed</span>`;
+          else pill = `<span class="pill orange">Take quiz</span>`;
+        } else {
+          pill = `<span class="chev">›</span>`;
+        }
+        return `<a href="#/quizzes/${q.id}/${user.role === "student" ? "take" : "results"}" class="list-item">
           <div class="list-icon">🧠</div>
           <div class="list-meta"><p class="t">${escapeHtml(q.title)} ${q.synced === false ? `<span class="pending-badge">⏳ pending</span>` : ""}</p>
             <p class="s">${escapeHtml(q.subject || "General")} · Grade ${q.grade} · ${q.questions.length} question${q.questions.length !== 1 ? "s" : ""}${q.due_date ? " · Due " + escapeHtml(q.due_date) : ""}</p></div>
-          ${user.role === "student" ? (attemptedIds.has(q.id) ? `<span class="pill green">Done</span>` : `<span class="pill orange">Take quiz</span>`) : `<span class="chev">›</span>`}
-        </a>`).join("")}
+          ${pill}
+        </a>`;
+      }).join("")}
     </div>`;
 };
 
@@ -517,13 +650,13 @@ Views.quizNew = (app) => {
   app.innerHTML = `
     ${topHeader("Create Quiz", "/quizzes")}
     <div style="padding: 16px 20px 0;">
-      <p style="font-size:13px; color:var(--text-sub); margin: -6px 0 16px;">Saved on this device immediately — reaches the whole grade next sync.</p>
+      <p style="font-size:13px; color:var(--text-sub); margin: -6px 0 16px;">Saved on this device immediately — reaches the whole grade next sync. Students can retake a quiz until its due date; their best score is what's recorded.</p>
       <form id="quizForm">
         <div class="field"><label>Quiz title</label><input type="text" name="title" required></div>
         <div class="field"><label>Subject</label><input type="text" name="subject"></div>
         <div class="field"><label>Grade</label><select name="grade" required><option value="">Select grade</option>
           ${[8,9,10,11,12].map((g) => `<option value="${g}">Grade ${g}</option>`).join("")}</select></div>
-        <div class="field"><label>Due date (optional)</label><input type="date" name="due_date"></div>
+        <div class="field"><label>Due date (optional — quiz closes to new attempts at the end of this day)</label><input type="date" name="due_date"></div>
         <div id="questionsWrap"></div>
         <button type="button" id="addQuestion" class="btn-secondary" style="margin-bottom:16px;">+ Add question</button>
         <button type="submit" class="btn-primary">Assign quiz to grade</button>
@@ -543,10 +676,31 @@ Views.quizNew = (app) => {
         <button type="button" class="remove-q" style="background:none;border:none;color:#C0392B;font-weight:700;font-size:12px;cursor:pointer;">Remove</button>
       </div>
       <div class="field"><input type="text" class="q-text" placeholder="Type your question"></div>
-      <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="0" checked><input type="text" class="q-opt" placeholder="Option A"></div>
-      <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="1"><input type="text" class="q-opt" placeholder="Option B"></div>
-      <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="2"><input type="text" class="q-opt" placeholder="Option C (optional)"></div>
-      <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="3"><input type="text" class="q-opt" placeholder="Option D (optional)"></div>`;
+      <div class="field">
+        <label>Answer type</label>
+        <select class="q-type">
+          <option value="mcq">Multiple Choice</option>
+          <option value="short">Short Answer (text or number)</option>
+        </select>
+      </div>
+      <div class="q-mcq-fields">
+        <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="0" checked><input type="text" class="q-opt" placeholder="Option A"></div>
+        <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="1"><input type="text" class="q-opt" placeholder="Option B"></div>
+        <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="2"><input type="text" class="q-opt" placeholder="Option C (optional)"></div>
+        <div class="option-row"><input type="radio" class="q-correct" name="correct-${i}" value="3"><input type="text" class="q-opt" placeholder="Option D (optional)"></div>
+      </div>
+      <div class="q-short-fields" style="display:none;">
+        <div class="field"><label>Correct answer</label><input type="text" class="q-short-answer" placeholder="e.g. 42 or photosynthesis"></div>
+        <p style="font-size:11px; color:var(--text-sub); margin:-8px 0 4px;">Checked as a text/number match (e.g. "4" matches "4" or "4.0") — not full algebra, so "2+2" won't automatically match "4".</p>
+      </div>`;
+    const typeSelect = div.querySelector(".q-type");
+    const mcqFields = div.querySelector(".q-mcq-fields");
+    const shortFields = div.querySelector(".q-short-fields");
+    typeSelect.addEventListener("change", () => {
+      const isShort = typeSelect.value === "short";
+      mcqFields.style.display = isShort ? "none" : "block";
+      shortFields.style.display = isShort ? "block" : "none";
+    });
     div.querySelector(".remove-q").addEventListener("click", () => div.remove());
     wrap.appendChild(div);
   }
@@ -559,12 +713,19 @@ Views.quizNew = (app) => {
     const questions = [];
     wrap.querySelectorAll(".q-block").forEach((block) => {
       const qtext = block.querySelector(".q-text").value.trim();
-      const opts = Array.from(block.querySelectorAll(".q-opt")).map((o) => o.value.trim());
-      const correctRaw = Array.from(block.querySelectorAll(".q-correct")).findIndex((r) => r.checked);
-      const kept = opts.map((o, idx) => ({ o, idx })).filter((x) => x.o);
-      if (qtext && kept.length >= 2) {
-        const newCorrect = kept.findIndex((k) => k.idx === correctRaw);
-        questions.push({ question: qtext, options: kept.map((k) => k.o), correct: newCorrect >= 0 ? newCorrect : 0 });
+      if (!qtext) return;
+      const type = block.querySelector(".q-type").value;
+      if (type === "short") {
+        const answer = block.querySelector(".q-short-answer").value.trim();
+        if (answer) questions.push({ type: "short", question: qtext, answer });
+      } else {
+        const opts = Array.from(block.querySelectorAll(".q-opt")).map((o) => o.value.trim());
+        const correctRaw = Array.from(block.querySelectorAll(".q-correct")).findIndex((r) => r.checked);
+        const kept = opts.map((o, idx) => ({ o, idx })).filter((x) => x.o);
+        if (kept.length >= 2) {
+          const newCorrect = kept.findIndex((k) => k.idx === correctRaw);
+          questions.push({ type: "mcq", question: qtext, options: kept.map((k) => k.o), correct: newCorrect >= 0 ? newCorrect : 0 });
+        }
       }
     });
     if (!questions.length) return UI.toast("Add at least one question.");
@@ -575,28 +736,49 @@ Views.quizNew = (app) => {
     };
     await DB.put("quizzes", quiz);
     UI.toast(navigator.onLine ? "Assigned — syncing now." : "Saved on this device — will assign once you're online.");
-    if (navigator.onLine) Sync.run(user, { silent: true }).then(() => Router.rerender());
+    if (navigator.onLine) Sync.run(user, { silent: true }); // don't force-rerender — could clobber an unrelated screen the user has since moved to
     location.hash = "#/quizzes";
   });
 };
 
 Views.quizTake = async (app, quizId) => {
-  const user = Session.current.user;
   const quiz = await DB.get("quizzes", quizId);
   if (!quiz) { app.innerHTML = `<div class="empty-state"><p>Quiz not found.</p></div>`; return; }
   const existing = (await DB.all("quiz_results")).find((r) => r.quiz_id === quizId);
+  const closed = isQuizClosed(quiz);
 
   if (existing) {
-    renderQuizResult(app, quiz, existing);
+    renderQuizResult(app, quiz, existing, { canRetake: !closed });
     return;
   }
+  if (closed) {
+    app.innerHTML = `${topHeader(quiz.title, "/quizzes")}
+      <div class="empty-state"><div class="emoji">🔒</div><p>This quiz is closed.${quiz.due_date ? ` It was due ${escapeHtml(quiz.due_date)}.` : ""}</p></div>`;
+    return;
+  }
+  renderQuizAttemptForm(app, quiz, existing);
+};
+
+function renderQuizAttemptForm(app, quiz, existing) {
+  const user = Session.current.user;
+  const attemptNum = (existing?.attempts || 0) + 1;
+  const hasShort = quiz.questions.some((q) => (q.type || "mcq") === "short");
 
   app.innerHTML = `
     ${topHeader(quiz.title, "/quizzes")}
-    <p style="padding: 0 20px; color:var(--text-sub); font-size:13px; margin: -4px 0 16px;">${escapeHtml(quiz.subject || "General")} · ${quiz.questions.length} questions</p>
+    <p style="padding: 0 20px; color:var(--text-sub); font-size:13px; margin: -4px 0 16px;">
+      ${escapeHtml(quiz.subject || "General")} · ${quiz.questions.length} questions
+      ${existing ? ` · Attempt ${attemptNum} · Best so far: ${existing.score}/${existing.total}` : ""}
+    </p>
     <form id="takeForm">
-      ${quiz.questions.map((q, qi) => `
-        <div class="card">
+      ${quiz.questions.map((q, qi) => {
+        if ((q.type || "mcq") === "short") {
+          return `<div class="card">
+            <b style="font-size:14.5px;">${qi + 1}. ${escapeHtml(q.question)}</b>
+            <div class="field" style="margin-top:12px; margin-bottom:0;"><input type="text" class="short-answer-input" name="q${qi}" placeholder="Type your answer" required autocomplete="off"></div>
+          </div>`;
+        }
+        return `<div class="card">
           <b style="font-size:14.5px;">${qi + 1}. ${escapeHtml(q.question)}</b>
           <div style="margin-top:12px;">
             ${q.options.map((opt, oi) => `
@@ -605,37 +787,69 @@ Views.quizTake = async (app, quizId) => {
                 <span style="flex:1; font-size:13.5px;">${escapeHtml(opt)}</span>
               </label>`).join("")}
           </div>
-        </div>`).join("")}
-      <div style="padding: 4px 20px 20px;"><button type="submit" class="btn-primary">Submit quiz</button></div>
+        </div>`;
+      }).join("")}
+      ${hasShort ? symbolPaletteHtml() : ""}
+      <div style="padding: 4px 20px 20px;"><button type="submit" class="btn-primary">Submit ${existing ? "attempt" : "quiz"}</button></div>
     </form>`;
+
+  if (hasShort) wireSymbolPalette(app);
 
   document.getElementById("takeForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const answers = quiz.questions.map((_, qi) => Number(fd.get(`q${qi}`)));
-    const score = quiz.questions.reduce((acc, q, qi) => acc + (answers[qi] === q.correct ? 1 : 0), 0);
-    const result = { id: uuid(), quiz_id: quizId, score, total: quiz.questions.length, answers, submitted_at: nowIso(), synced: false };
-    await DB.put("quiz_results", result);
-    if (navigator.onLine) Sync.run(user, { silent: true });
-    renderQuizResult(app, quiz, result);
-  });
-};
+    const answers = quiz.questions.map((q, qi) => ((q.type || "mcq") === "short" ? (fd.get(`q${qi}`) || "") : Number(fd.get(`q${qi}`))));
+    const thisScore = quiz.questions.reduce((acc, q, qi) => acc + (gradeQuestion(q, answers[qi]) ? 1 : 0), 0);
+    const total = quiz.questions.length;
 
-function renderQuizResult(app, quiz, result) {
+    const result = {
+      id: existing?.id || uuid(),
+      quiz_id: quiz.id,
+      score: Math.max(existing?.score || 0, thisScore),  // recorded score = best ever, WeBWorK-style
+      total,
+      answers,                                             // feedback always reflects the attempt just made
+      attempts: (existing?.attempts || 0) + 1,
+      submitted_at: nowIso(),
+      synced: false,
+    };
+    await DB.put("quiz_results", result);
+    if (Session.current?.user && navigator.onLine) Sync.run(Session.current.user, { silent: true });
+    renderQuizResult(app, quiz, result, { canRetake: !isQuizClosed(quiz), justScored: thisScore });
+  });
+}
+
+function renderQuizResult(app, quiz, result, { canRetake = true, justScored = null } = {}) {
   const pct = Math.round((result.score / result.total) * 100);
   app.innerHTML = `
     ${topHeader(quiz.title, "/quizzes")}
     <div style="text-align:center; padding: 10px 20px;">
       <div class="score-ring" style="--pct: ${pct};"><div class="inner"><b>${pct}%</b><span>${result.score}/${result.total}</span></div></div>
-      <p style="font-weight:700; margin:0 0 4px;">${pct >= 80 ? "Excellent work! 🎉" : pct >= 50 ? "Good effort! 👍" : "Keep practicing 💪"}</p>
+      <p style="font-weight:700; margin:0 0 2px;">${pct >= 80 ? "Excellent work! 🎉" : pct >= 50 ? "Good effort! 👍" : "Keep practicing 💪"}</p>
+      <p style="font-size:12.5px; color:var(--text-sub); margin:0;">
+        Recorded (best) score · attempted ${result.attempts} time${result.attempts !== 1 ? "s" : ""}
+        ${justScored !== null ? ` · this attempt: ${justScored}/${result.total}` : ""}
+      </p>
     </div>
-    ${quiz.questions.map((q, qi) => `
-      <div class="card">
+    ${quiz.questions.map((q, qi) => {
+      const type = q.type || "mcq";
+      const given = result.answers[qi];
+      if (type === "short") {
+        const correct = gradeShortAnswer(given, q.answer);
+        return `<div class="card">
+          <b style="font-size:14px;">${qi + 1}. ${escapeHtml(q.question)}</b>
+          <div class="option-row" style="margin-top:10px; padding:10px 12px; border-radius:12px; border:1.5px solid ${correct ? "#22C55E" : "#C0392B"}; background:${correct ? "#E9F9EE" : "#FEEAEA"};">
+            <span style="flex:1; font-size:13.5px;">Your answer: <b>${escapeHtml(given || "(blank)")}</b></span>
+            <span style="color:${correct ? "#22C55E" : "#C0392B"}; font-weight:700; font-size:12px;">${correct ? "✓ Correct" : "✕ Incorrect"}</span>
+          </div>
+          ${!correct ? `<div style="margin-top:8px; font-size:13px; color:var(--text-sub);">Correct answer: <b style="color:var(--text-main);">${escapeHtml(q.answer)}</b></div>` : ""}
+        </div>`;
+      }
+      return `<div class="card">
         <b style="font-size:14px;">${qi + 1}. ${escapeHtml(q.question)}</b>
         <div style="margin-top:10px;">
           ${q.options.map((opt, oi) => {
             const isCorrect = oi === q.correct;
-            const isGiven = oi === result.answers[qi];
+            const isGiven = oi === given;
             const border = isCorrect ? "#22C55E" : (isGiven ? "#C0392B" : "var(--border)");
             const bg = isCorrect ? "#E9F9EE" : (isGiven && !isCorrect ? "#FEEAEA" : "#fff");
             return `<div class="option-row" style="padding:10px 12px; border-radius:12px; border:1.5px solid ${border}; background:${bg};">
@@ -644,15 +858,22 @@ function renderQuizResult(app, quiz, result) {
             </div>`;
           }).join("")}
         </div>
-      </div>`).join("")}`;
+      </div>`;
+    }).join("")}
+    <div style="padding: 4px 20px 24px;">
+      ${canRetake
+        ? `<button id="retakeBtn" class="btn-primary">Try again</button>`
+        : `<div class="empty-state" style="padding:16px;"><p>This quiz is now closed — this is your final recorded score.</p></div>`}
+    </div>`;
+
+  document.getElementById("retakeBtn")?.addEventListener("click", () => renderQuizAttemptForm(app, quiz, result));
 }
 
 Views.quizResultsTeacher = async (app, quizId) => {
-  const user = Session.current.user;
   const quiz = await DB.get("quizzes", quizId);
   if (!quiz) { app.innerHTML = `<div class="empty-state"><p>Quiz not found.</p></div>`; return; }
   app.innerHTML = `${topHeader(quiz.title, "/quizzes")}
-    <p style="padding: 0 20px; color:var(--text-sub); font-size:13px; margin: -4px 0 16px;">Grade ${quiz.grade} · results load when you're online</p>
+    <p style="padding: 0 20px; color:var(--text-sub); font-size:13px; margin: -4px 0 16px;">Grade ${quiz.grade} · best score per student · results load when you're online</p>
     <div id="resultsBox" class="card" style="text-align:center; color:var(--text-sub);">${navigator.onLine ? "Loading…" : "You're offline — connect to see submissions from the whole grade."}</div>`;
   if (!navigator.onLine) return;
   try {
@@ -661,7 +882,7 @@ Views.quizResultsTeacher = async (app, quizId) => {
     if (!data.results.length) { box.innerHTML = "No submissions yet."; return; }
     box.outerHTML = data.results.map((r, i) => `
       <div class="list-item"><div class="list-icon">${i + 1}</div>
-        <div class="list-meta"><p class="t">${escapeHtml(r.full_name)}</p><p class="s">Submitted ${escapeHtml(r.submitted_at)}</p></div>
+        <div class="list-meta"><p class="t">${escapeHtml(r.full_name)}</p><p class="s">${r.attempts || 1} attempt${(r.attempts || 1) !== 1 ? "s" : ""} · last ${escapeHtml(r.submitted_at)}</p></div>
         <span class="pill ${r.score / r.total >= 0.5 ? "green" : ""}">${r.score}/${r.total}</span></div>`).join("");
   } catch (e) { document.getElementById("resultsBox").textContent = "Couldn't load results right now."; }
 };
@@ -886,7 +1107,7 @@ Views.homeworkNew = (app) => {
     };
     await DB.put("homework", hw);
     UI.toast(navigator.onLine ? "Assigned — syncing now." : "Saved — will assign once you're online.");
-    if (navigator.onLine) Sync.run(user, { silent: true }).then(() => Router.rerender());
+    if (navigator.onLine) Sync.run(user, { silent: true }); // don't force-rerender — could clobber an unrelated screen the user has since moved to
     location.hash = "#/library";
   });
 };

@@ -483,3 +483,13 @@ body {
 }
 
 .link-btn { background:none; border:none; color: var(--orange); font-weight:700; font-size: 13px; cursor:pointer; padding: 0; }
+
+/* ---------- v2: short-answer symbol palette (math symbols for quiz input) ---------- */
+.symbol-palette { margin: 4px 0 2px; }
+.symbol-btn {
+  min-width: 42px; height: 42px; padding: 0 12px; border-radius: 10px;
+  border: none; background: var(--black-card); color: #fff;
+  font-size: 16px; font-weight: 700; cursor: pointer;
+  transition: transform .1s ease;
+}
+.symbol-btn:active { transform: scale(0.92); background: var(--orange); }

@@ -18,6 +18,8 @@ import json
 import sqlite3
 import secrets
 import uuid
+import time
+import random
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -46,9 +48,10 @@ app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 # --------------------------------------------------------------------------
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA busy_timeout = 8000")  # wait up to 8s on a brief lock, instead of failing instantly
     return g.db
 
 
@@ -61,21 +64,50 @@ def close_db(exception=None):
 
 def init_db():
     db = sqlite3.connect(DB_PATH)
+    # WAL mode lets reads and a write happen at the same time instead of
+    # blocking each other — the difference between "briefly queued" and
+    # "database is locked" errors when many students sync at once. This
+    # is a persistent, one-time setting on the database file itself.
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")  # safe pairing with WAL, much faster than FULL
     with open(os.path.join(BASE_DIR, "schema.sql"), "r") as f:
         db.executescript(f.read())
     db.execute("INSERT OR IGNORE INTO admin_lock (id, locked) VALUES (1, 0)")
     db.commit()
-    count = db.execute("SELECT COUNT(*) FROM schools").fetchone()[0]
-    if count == 0 and os.path.exists(SCHOOLS_JSON):
-        with open(SCHOOLS_JSON, "r", encoding="utf-8") as f:
-            schools = json.load(f)
-        db.executemany(
-            "INSERT OR IGNORE INTO schools (emis, name, province, district, type, phase, town) "
-            "VALUES (:emis, :name, :province, :district, :type, :phase, :town)",
-            schools,
-        )
+
+    # --- lightweight migration for databases that already existed before
+    # this column was added (e.g. your live Render database) ---
+    # CREATE TABLE IF NOT EXISTS above does nothing on a table that
+    # already exists, so a brand-new column needs its own ALTER TABLE.
+    # SQLite has no "ADD COLUMN IF NOT EXISTS", so we just try it and
+    # ignore the error if the column is already there.
+    try:
+        db.execute("ALTER TABLE quiz_results ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
         db.commit()
-        print(f"[init_db] Loaded {len(schools)} schools from EMIS master list.")
+        print("[init_db] Migrated: added quiz_results.attempts column.")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    count = db.execute("SELECT COUNT(*) FROM schools").fetchone()[0]
+    if count == 0:
+        if not os.path.exists(SCHOOLS_JSON):
+            # Loud on purpose: this used to fail silently, leaving every
+            # search returning [] forever with nothing in the logs to
+            # explain why. Now it's impossible to miss in Render's log tab.
+            print(f"[init_db] ERROR: schools file not found at {SCHOOLS_JSON} — "
+                  f"school search will return no results until this is fixed. "
+                  f"Check that data/sa_schools.json was committed to the repo "
+                  f"at exactly that path (case-sensitive).")
+        else:
+            with open(SCHOOLS_JSON, "r", encoding="utf-8") as f:
+                schools = json.load(f)
+            db.executemany(
+                "INSERT OR IGNORE INTO schools (emis, name, province, district, type, phase, town) "
+                "VALUES (:emis, :name, :province, :district, :type, :phase, :town)",
+                schools,
+            )
+            db.commit()
+            print(f"[init_db] Loaded {len(schools)} schools from EMIS master list.")
     db.close()
 
 
@@ -113,6 +145,39 @@ def auth_required(view):
         g.user = user
         return view(*args, **kwargs)
     return wrapped
+
+
+def retry_on_locked(max_attempts=6, base_delay=0.05):
+    """
+    SQLite only allows one writer at a time. Under a real burst — a
+    classroom of students all logging in within the same second, say —
+    WAL mode and busy_timeout reduce contention a lot but don't fully
+    eliminate the rare 'database is locked' error when many writes land
+    in the same instant. Rather than that surfacing as a 500 to someone
+    just trying to log in, retry the whole write with a short random
+    backoff — a few hundred milliseconds of invisible retrying beats a
+    visible failure.
+    """
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            attempt = 0
+            while True:
+                try:
+                    return view(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if "locked" not in str(e).lower() or attempt >= max_attempts - 1:
+                        raise
+                    db = g.pop("db", None)
+                    if db is not None:
+                        try:
+                            db.close()
+                        except Exception:
+                            pass
+                    time.sleep(base_delay * (2 ** attempt) + random.uniform(0, 0.03))
+                    attempt += 1
+        return wrapped
+    return decorator
 
 
 def role_required(*roles):
@@ -164,10 +229,29 @@ def service_worker():
     return resp
 
 
+@app.route("/static/data/sa_schools.json")
+def schools_bundle():
+    """
+    Serves the pre-gzipped, full 25,493-school list as one static download.
+    Devices fetch this ONCE (cached by the service worker + IndexedDB after
+    that) and search it entirely client-side from then on — this is what
+    keeps live per-keystroke search queries off the database/server, which
+    matters a lot on a free-tier instance serving thousands of signups.
+    """
+    gz_path = os.path.join(STATIC_DIR, "data", "sa_schools.json.gz")
+    with open(gz_path, "rb") as f:
+        data = f.read()
+    resp = app.response_class(data, mimetype="application/json")
+    resp.headers["Content-Encoding"] = "gzip"
+    resp.headers["Cache-Control"] = "public, max-age=604800"  # 7 days — this list rarely changes
+    return resp
+
+
 # --------------------------------------------------------------------------
 # AUTH API
 # --------------------------------------------------------------------------
 @app.route("/api/auth/signup", methods=["POST"])
+@retry_on_locked()
 def api_signup():
     data = request.get_json(force=True)
     db = get_db()
@@ -207,6 +291,7 @@ def api_signup():
 
 
 @app.route("/api/auth/login", methods=["POST"])
+@retry_on_locked()
 def api_login():
     data = request.get_json(force=True)
     db = get_db()
@@ -223,6 +308,7 @@ def api_login():
 
 @app.route("/api/auth/logout", methods=["POST"])
 @auth_required
+@retry_on_locked()
 def api_logout():
     db = get_db()
     auth = request.headers.get("Authorization", "")
@@ -240,6 +326,7 @@ def api_me():
 
 
 @app.route("/api/auth/forgot-password", methods=["POST"])
+@retry_on_locked()
 def api_forgot_password():
     data = request.get_json(force=True)
     db = get_db()
@@ -261,6 +348,7 @@ def api_forgot_password():
 
 
 @app.route("/api/auth/reset-password", methods=["POST"])
+@retry_on_locked()
 def api_reset_password():
     data = request.get_json(force=True)
     db = get_db()
@@ -348,6 +436,7 @@ def api_sync_pull():
 
 @app.route("/api/sync/push", methods=["POST"])
 @auth_required
+@retry_on_locked()
 def api_sync_push():
     """
     Accepts whatever the device queued while offline: new/edited notes,
@@ -401,15 +490,26 @@ def api_sync_push():
 
     for r in data.get("quiz_results", []):
         rid = r.get("id") or new_id()
-        try:
-            db.execute(
-                "INSERT INTO quiz_results (id, quiz_id, student_id, score, total, answers_json) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (rid, r["quiz_id"], user["id"], r["score"], r["total"], json.dumps(r.get("answers", []))),
-            )
-            result["quiz_results"].append(rid)
-        except sqlite3.IntegrityError:
-            pass  # already submitted — ignore duplicate
+        attempts = int(r.get("attempts", 1))
+        # WeBWorK-style: a student can retake a quiz, and the RECORDED
+        # score is the best one so far, with an attempt counter that only
+        # ever goes up. The device already tracks its own best-so-far
+        # locally (see sync.js / app.js), so this just needs to merge
+        # that into the server's copy without ever losing a higher score
+        # or a higher attempt count from a previous sync (e.g. if the
+        # same student's two devices sync in an unexpected order).
+        db.execute(
+            "INSERT INTO quiz_results (id, quiz_id, student_id, score, total, answers_json, attempts, submitted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(quiz_id, student_id) DO UPDATE SET "
+            "  score = MAX(quiz_results.score, excluded.score), "
+            "  total = excluded.total, "
+            "  answers_json = excluded.answers_json, "  # always the most recent attempt, for feedback — score stays the best
+            "  attempts = MAX(quiz_results.attempts, excluded.attempts), "
+            "  submitted_at = excluded.submitted_at",
+            (rid, r["quiz_id"], user["id"], r["score"], r["total"], json.dumps(r.get("answers", [])), attempts, now_iso()),
+        )
+        result["quiz_results"].append(rid)
 
     for p in data.get("planner", []):
         pid = p.get("id") or new_id()
@@ -429,6 +529,7 @@ def api_sync_push():
 
 @app.route("/api/notes/<note_id>/upload", methods=["POST"])
 @role_required("teacher", "admin")
+@retry_on_locked()
 def api_note_upload(note_id):
     db = get_db()
     note = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
@@ -451,6 +552,7 @@ def api_note_upload(note_id):
 # --------------------------------------------------------------------------
 @app.route("/api/admin/claim", methods=["POST"])
 @auth_required
+@retry_on_locked()
 def api_admin_claim():
     db = get_db()
     lock = db.execute("SELECT * FROM admin_lock WHERE id = 1").fetchone()
@@ -506,6 +608,7 @@ def api_admin_users():
 
 @app.route("/api/admin/users/<user_id>/remove", methods=["POST"])
 @role_required("admin")
+@retry_on_locked()
 def api_admin_user_remove(user_id):
     db = get_db()
     target = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()

@@ -4,7 +4,7 @@
 // homework, results) lives in IndexedDB, not here — this worker's only
 // job is making sure the CODE that reads IndexedDB is always available.
 
-const CACHE_NAME = "sa-offline-learning-shell-v1";
+const CACHE_NAME = "sa-offline-learning-shell-v3"; // bumped: WeBWorK-style quizzes (multi-attempt, short-answer, due-date close)
 const APP_SHELL = [
   "/",
   "/static/index.html",
